@@ -1,4 +1,4 @@
-"""Backtesting engine - orchestrates the full simulation loop."""
+"""Backtesting engine."""
 
 import uuid
 from dataclasses import dataclass, field
@@ -13,7 +13,6 @@ from oil_bot.strategies.interfaces import IStrategy
 from oil_bot.utils.logging import get_logger
 
 logger = get_logger(__name__)
-
 SYMBOL_KEY = "ASSET"
 
 
@@ -50,9 +49,9 @@ class Backtester:
         config_snapshot: BacktestConfig | None = None,
     ) -> BacktestResult:
         """Run the backtest on an enriched DataFrame."""
-        run_id = str(uuid.uuid4())
+        rid = str(uuid.uuid4())
         logger.info(
-            f"[{run_id[:8]}] Backtest start: {self.strategy.name}, "
+            f"[{rid[:8]}] Backtest: {self.strategy.name}, "
             f"{len(data)} bars."
         )
 
@@ -60,130 +59,158 @@ class Backtester:
             timestamp=data.index[0], cash=self.initial_capital
         )
 
-        equity_curve: list[float] = []
-        trades_log: list[dict] = []
-        signals_log: list[dict] = []
-
+        eq, tl, sl = [], [], []
         n = len(data)
+
         for i in range(n):
-            current_bar = data.iloc[i]
-            current_price = float(current_bar["close"])
+            bar = data.iloc[i]
+            current_price = float(bar["close"])
+            low_price = float(bar["low"])
             prices = {SYMBOL_KEY: current_price}
 
-            # 1. Record equity at this bar
-            equity_curve.append(portfolio.equity(prices))
+            # 1. Enregistrer l'equity
+            eq.append(portfolio.equity(prices))
 
-            # 2. Generate signal using only data up to bar i
+            # 2. Vérifier le stop loss
+            if SYMBOL_KEY in portfolio.positions:
+                pos = portfolio.positions[SYMBOL_KEY]
+                stop = getattr(pos, "stop_loss", None)
+                if stop is not None and low_price <= stop:
+                    revenue = stop * pos.quantity
+                    pnl = revenue - pos.avg_entry_price * pos.quantity
+                    pnl_pct = (stop - pos.avg_entry_price) / pos.avg_entry_price
+                    portfolio.cash += revenue
+                    tl.append({
+                        "timestamp": bar.name,
+                        "side": "SELL (SL)",
+                        "quantity": pos.quantity,
+                        "fill_price": stop,
+                        "entry_price": pos.avg_entry_price,
+                        "stop_loss": stop,
+                        "fees": 0.0,
+                        "pnl": pnl,
+                        "pnl_pct": round(pnl_pct, 6),
+                    })
+                    sl.append({
+                        "timestamp": bar.name,
+                        "action": "STOP_LOSS",
+                        "confidence": 1.0,
+                    })
+                    del portfolio.positions[SYMBOL_KEY]
+                    continue
+
+            # 3. Générer le signal
             history = data.iloc[: i + 1]
             signal = self.strategy.generate_signal(history)
-            signals_log.append(
-                {
-                    "timestamp": current_bar.name,
-                    "action": signal.action,
-                    "confidence": signal.confidence,
-                }
-            )
+            sl.append({
+                "timestamp": bar.name,
+                "action": signal.action,
+                "confidence": signal.confidence,
+            })
 
-            # 3. Risk manager evaluates the signal
-            order = self.risk_manager.evaluate(signal, portfolio, current_bar)
+            # 4. Évaluer le risque
+            order = self.risk_manager.evaluate(signal, portfolio, bar)
 
-            # 4. Execute at the OPEN of bar i+1 (anti look-ahead)
+            # 5. Exécuter au bar suivant (anti look-ahead)
             if order is not None and i < n - 1:
                 next_bar = data.iloc[i + 1]
                 trade = self.executor.execute(order, next_bar)
-                self._apply_trade(trade, portfolio, trades_log)
+                self._apply(trade, portfolio, tl)
 
-        # Close any remaining position at the last close
+        # Fermer la position restante
         if not portfolio.is_flat():
-            self._force_close(portfolio, data.iloc[-1], trades_log)
+            self._close(portfolio, data.iloc[-1], tl)
 
-        equity_series = pd.Series(
-            equity_curve, index=data.index, name="equity"
-        )
-        metrics = MetricsCalculator().compute(equity_series, trades_log)
+        es = pd.Series(eq, index=data.index, name="equity")
+        metrics = MetricsCalculator().compute(es, tl)
 
         logger.info(
-            f"[{run_id[:8]}] Done. Trades: {metrics.get('n_trades', 0)}, "
-            f"Return: {metrics.get('total_return', 0):.2%}, "
-            f"Sharpe: {metrics.get('sharpe', 0):.2f}"
+            f"[{rid[:8]}] Done. Trades: {metrics.get('n_trades', 0)}, "
+            f"Return: {metrics.get('total_return', 0):.2%}"
         )
 
         return BacktestResult(
-            run_id=run_id,
-            config_snapshot=config_snapshot or BacktestConfig(),
-            equity_curve=equity_series,
-            trades=pd.DataFrame(trades_log),
-            signals=pd.DataFrame(signals_log),
-            metrics=metrics,
+            rid,
+            config_snapshot or BacktestConfig(),
+            es,
+            pd.DataFrame(tl),
+            pd.DataFrame(sl),
+            metrics,
         )
 
-    def _apply_trade(
-        self, trade: Trade, portfolio: PortfolioState, trades_log: list[dict]
-    ) -> None:
-        """Update portfolio after a trade and record it."""
-        side = trade.order.side
+    def _apply(self, trade: Trade, portfolio: PortfolioState, tl: list) -> None:
+        """Update portfolio after a trade."""
+        if trade.order.side == "BUY":
+            portfolio.cash -= trade.fill_price * trade.quantity + trade.fees
 
-        if side == "BUY":
-            cost = trade.fill_price * trade.quantity + trade.fees
-            portfolio.cash -= cost
-            portfolio.positions[SYMBOL_KEY] = Position(
+            pos = Position(
                 symbol=SYMBOL_KEY,
                 quantity=trade.quantity,
                 avg_entry_price=trade.fill_price,
                 entry_timestamp=trade.fill_timestamp,
             )
-            trades_log.append(
-                {
-                    "timestamp": trade.fill_timestamp,
-                    "side": "BUY",
-                    "quantity": trade.quantity,
-                    "fill_price": trade.fill_price,
-                    "fees": trade.fees,
-                    "pnl": 0.0,
-                }
-            )
+            pos.stop_loss = trade.order.stop_loss
+            portfolio.positions[SYMBOL_KEY] = pos
 
-        elif side == "SELL" and SYMBOL_KEY in portfolio.positions:
+            tl.append({
+                "timestamp": trade.fill_timestamp,
+                "side": "BUY",
+                "quantity": trade.quantity,
+                "fill_price": trade.fill_price,
+                "entry_price": trade.fill_price,
+                "stop_loss": trade.order.stop_loss,
+                "fees": trade.fees,
+                "pnl": 0.0,
+                "pnl_pct": 0.0,
+            })
+
+        elif trade.order.side == "SELL" and SYMBOL_KEY in portfolio.positions:
             pos = portfolio.positions[SYMBOL_KEY]
             revenue = trade.fill_price * trade.quantity - trade.fees
-            cost_basis = pos.avg_entry_price * pos.quantity
-            pnl = revenue - cost_basis
+            pnl = revenue - pos.avg_entry_price * pos.quantity
+            pnl_pct = (
+                (trade.fill_price - pos.avg_entry_price)
+                / pos.avg_entry_price
+            )
             portfolio.cash += revenue
             del portfolio.positions[SYMBOL_KEY]
-            trades_log.append(
-                {
-                    "timestamp": trade.fill_timestamp,
-                    "side": "SELL",
-                    "quantity": trade.quantity,
-                    "fill_price": trade.fill_price,
-                    "fees": trade.fees,
-                    "pnl": pnl,
-                }
-            )
 
-    def _force_close(
+            tl.append({
+                "timestamp": trade.fill_timestamp,
+                "side": "SELL",
+                "quantity": trade.quantity,
+                "fill_price": trade.fill_price,
+                "entry_price": pos.avg_entry_price,
+                "stop_loss": None,
+                "fees": trade.fees,
+                "pnl": pnl,
+                "pnl_pct": round(pnl_pct, 6),
+            })
+
+    def _close(
         self,
         portfolio: PortfolioState,
         last_bar: pd.Series,
-        trades_log: list[dict],
+        tl: list,
     ) -> None:
-        """Force-close any open position at the last close price."""
+        """Force-close any open position at last close price."""
         if SYMBOL_KEY not in portfolio.positions:
             return
         pos = portfolio.positions[SYMBOL_KEY]
-        close_price = float(last_bar["close"])
-        revenue = close_price * pos.quantity
-        cost_basis = pos.avg_entry_price * pos.quantity
-        pnl = revenue - cost_basis
-        portfolio.cash += revenue
+        price = float(last_bar["close"])
+        pnl = price * pos.quantity - pos.avg_entry_price * pos.quantity
+        pnl_pct = (price - pos.avg_entry_price) / pos.avg_entry_price
+        portfolio.cash += price * pos.quantity
         del portfolio.positions[SYMBOL_KEY]
-        trades_log.append(
-            {
-                "timestamp": last_bar.name,
-                "side": "SELL",
-                "quantity": pos.quantity,
-                "fill_price": close_price,
-                "fees": 0.0,
-                "pnl": pnl,
-            }
-        )
+
+        tl.append({
+            "timestamp": last_bar.name,
+            "side": "SELL",
+            "quantity": pos.quantity,
+            "fill_price": price,
+            "entry_price": pos.avg_entry_price,
+            "stop_loss": None,
+            "fees": 0.0,
+            "pnl": pnl,
+            "pnl_pct": round(pnl_pct, 6),
+        })

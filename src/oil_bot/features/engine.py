@@ -35,7 +35,5 @@ class FeatureEngine:
         result["atr_14"] = ATR(period=14).compute(df)
         result["close_pct_change"] = df["close"].pct_change()
 
-        logger.info(
-            f"FeatureEngine: added {len(result.columns) - n_before} columns."
-        )
+        logger.debug(f"FeatureEngine: added {len(result.columns) - n_before} columns.")
         return result
