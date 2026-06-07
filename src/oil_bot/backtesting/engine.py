@@ -56,7 +56,8 @@ class Backtester:
         )
 
         portfolio = PortfolioState(
-            timestamp=data.index[0], cash=self.initial_capital
+            timestamp=data.index[0],
+            cash=self.initial_capital,
         )
 
         eq, tl, sl = [], [], []
@@ -72,21 +73,29 @@ class Backtester:
             eq.append(portfolio.equity(prices))
 
             # 2. Vérifier le stop loss
+            stop_triggered = False
             if SYMBOL_KEY in portfolio.positions:
                 pos = portfolio.positions[SYMBOL_KEY]
                 stop = getattr(pos, "stop_loss", None)
                 if stop is not None and low_price <= stop:
-                    revenue = stop * pos.quantity
+                    # Stop loss déclenché
+                    stop_price = float(stop)
+                    revenue = stop_price * pos.quantity
                     pnl = revenue - pos.avg_entry_price * pos.quantity
-                    pnl_pct = (stop - pos.avg_entry_price) / pos.avg_entry_price
+                    pnl_pct = (
+                        (stop_price - pos.avg_entry_price)
+                        / pos.avg_entry_price
+                    )
                     portfolio.cash += revenue
+                    del portfolio.positions[SYMBOL_KEY]
+
                     tl.append({
                         "timestamp": bar.name,
                         "side": "SELL (SL)",
                         "quantity": pos.quantity,
-                        "fill_price": stop,
+                        "fill_price": stop_price,
                         "entry_price": pos.avg_entry_price,
-                        "stop_loss": stop,
+                        "stop_loss": stop_price,
                         "fees": 0.0,
                         "pnl": pnl,
                         "pnl_pct": round(pnl_pct, 6),
@@ -96,8 +105,10 @@ class Backtester:
                         "action": "STOP_LOSS",
                         "confidence": 1.0,
                     })
-                    del portfolio.positions[SYMBOL_KEY]
-                    continue
+                    stop_triggered = True
+
+            if stop_triggered:
+                continue
 
             # 3. Générer le signal
             history = data.iloc[: i + 1]
@@ -125,8 +136,10 @@ class Backtester:
         metrics = MetricsCalculator().compute(es, tl)
 
         logger.info(
-            f"[{rid[:8]}] Done. Trades: {metrics.get('n_trades', 0)}, "
-            f"Return: {metrics.get('total_return', 0):.2%}"
+            f"[{rid[:8]}] Done. "
+            f"Trades: {metrics.get('n_trades', 0)}, "
+            f"Return: {metrics.get('total_return', 0):.2%}, "
+            f"Sharpe: {metrics.get('sharpe', 0):.2f}"
         )
 
         return BacktestResult(
@@ -138,17 +151,21 @@ class Backtester:
             metrics,
         )
 
-    def _apply(self, trade: Trade, portfolio: PortfolioState, tl: list) -> None:
+    def _apply(
+        self, trade: Trade, portfolio: PortfolioState, tl: list
+    ) -> None:
         """Update portfolio after a trade."""
         if trade.order.side == "BUY":
-            portfolio.cash -= trade.fill_price * trade.quantity + trade.fees
-
+            portfolio.cash -= (
+                trade.fill_price * trade.quantity + trade.fees
+            )
             pos = Position(
                 symbol=SYMBOL_KEY,
                 quantity=trade.quantity,
                 avg_entry_price=trade.fill_price,
                 entry_timestamp=trade.fill_timestamp,
             )
+            # Stocker le stop loss dans la position
             pos.stop_loss = trade.order.stop_loss
             portfolio.positions[SYMBOL_KEY] = pos
 
@@ -164,7 +181,10 @@ class Backtester:
                 "pnl_pct": 0.0,
             })
 
-        elif trade.order.side == "SELL" and SYMBOL_KEY in portfolio.positions:
+        elif (
+            trade.order.side == "SELL"
+            and SYMBOL_KEY in portfolio.positions
+        ):
             pos = portfolio.positions[SYMBOL_KEY]
             revenue = trade.fill_price * trade.quantity - trade.fees
             pnl = revenue - pos.avg_entry_price * pos.quantity
