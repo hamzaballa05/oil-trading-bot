@@ -218,6 +218,6 @@ __marimo__/
 .streamlit/secrets.toml
 # Ajouts projet
 .venv/
-data/
+/data/
 *.parquet
 config/secrets.yaml

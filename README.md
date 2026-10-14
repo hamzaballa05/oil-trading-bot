@@ -42,7 +42,6 @@ git clone https://github.com/hamzaballa05/oil-trading-bot
 cd oil-trading-bot
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pip install scikit-learn textblob joblib
 ```
 
 ## Utilisation
